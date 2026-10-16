@@ -1,8 +1,10 @@
 name: 야영장 빈자리 확인
 
+# GitHub 예약 실행은 몇 시간씩 밀리기도 해서, 한 번 시작하면 약 5시간 40분 동안
+# 2분마다 반복 확인한다. 매시간 다음 실행을 대기열에 넣어두면 끊김 없이 이어진다.
 on:
   schedule:
-    - cron: "*/5 * * * *"   # 5분마다 (GitHub 사정으로 몇 분씩 늦어질 수 있음)
+    - cron: "7 * * * *"
   workflow_dispatch:         # Actions 탭에서 수동 실행 버튼
 
 permissions:
@@ -10,22 +12,25 @@ permissions:
 
 concurrency:
   group: check
-  cancel-in-progress: false
+  cancel-in-progress: false  # 실행 중이면 다음 실행은 대기했다가 이어받음
 
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: 빈자리 확인
+      - name: 빈자리 확인 (2분 간격 반복)
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-        run: python check.py
+          LOOP_MINUTES: "340"
+          INTERVAL_SEC: "120"
+        run: python -u check.py
       - name: 상태 저장
+        if: always()
         run: |
           if [ -n "$(git status --porcelain state.json)" ]; then
             git config user.name "github-actions"

@@ -2,9 +2,13 @@
 
 dates.txt 에 적힌 날짜마다 일반(G)/자동차(C) 야영장의 예약가능 사이트를 조회하고,
 지난번보다 새로 열린 자리가 있으면 ntfy 로 휴대폰에 알림을 보낸다.
+
+GitHub 예약 실행(cron)은 몇 시간씩 밀리기 일쑤라, 한 번 실행되면
+LOOP_MINUTES 동안 INTERVAL_SEC 마다 반복 확인한다.
 """
 import json
 import os
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -21,27 +25,41 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DATES_FILE = os.path.join(HERE, "dates.txt")
 STATE_FILE = os.path.join(HERE, "state.json")
 KST = timezone(timedelta(hours=9))
+LOOP_MINUTES = float(os.environ.get("LOOP_MINUTES", "0"))  # 0 이면 한 번만
+INTERVAL_SEC = int(os.environ.get("INTERVAL_SEC", "120"))
+
+
+def dates_text():
+    """실행 도중 dates.txt 가 GitHub 에서 수정돼도 반영되도록 원격 최신본을 우선 읽는다."""
+    if LOOP_MINUTES:
+        try:
+            subprocess.run(["git", "fetch", "-q", "origin", "main"], cwd=HERE, check=True, timeout=30)
+            return subprocess.run(["git", "show", "FETCH_HEAD:dates.txt"], cwd=HERE, check=True,
+                                  capture_output=True, timeout=30).stdout.decode("utf-8")
+        except Exception as e:
+            print(f"원격 dates.txt 읽기 실패, 로컬 파일 사용: {e}")
+    with open(DATES_FILE, encoding="utf-8") as f:
+        return f.read()
 
 
 def read_dates():
     """dates.txt 한 줄에 하나: '2026-11-07' (둘 다) 또는 '2026-11-07 C' (자동차만)."""
     today = datetime.now(KST).date()
     targets = []
-    with open(DATES_FILE, encoding="utf-8") as f:
-        for line in f:
-            line = line.split("#", 1)[0].strip()
-            if not line:
-                continue
-            parts = line.split()
-            try:
-                d = date.fromisoformat(parts[0])
-            except ValueError:
-                print(f"날짜 형식 오류, 건너뜀: {line}")
-                continue
-            if d < today:
-                continue
-            types = [t.upper() for t in parts[1:] if t.upper() in TYPES] or list(TYPES)
-            targets.append((d.isoformat(), types))
+    for line in dates_text().splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split()
+        try:
+            d = date.fromisoformat(parts[0])
+        except ValueError:
+            print(f"날짜 형식 오류, 건너뜀: {line}")
+            continue
+        if d < today:
+            continue
+        types = [t.upper() for t in parts[1:] if t.upper() in TYPES] or list(TYPES)
+        targets.append((d.isoformat(), types))
     return targets
 
 
@@ -78,14 +96,9 @@ def notify(title, message):
     urllib.request.urlopen(req, timeout=20).read()
 
 
-def main():
+def check_once(state):
+    """한 번 조회하고 알림을 보낸 뒤 새 상태를 돌려준다."""
     targets = read_dates()
-    try:
-        with open(STATE_FILE, encoding="utf-8") as f:
-            state = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        state = {}
-
     new_state = {}
     alerts = []
     for ymd, types in targets:
@@ -108,10 +121,32 @@ def main():
 
     if alerts:
         notify("🏕️ 시민의숲 야영장 빈자리!", "\n".join(alerts) + "\n\n눌러서 예약 페이지 열기")
+    return new_state
 
-    if new_state != state:
+
+def main():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            state = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        state = {}
+    first = state
+
+    deadline = time.monotonic() + LOOP_MINUTES * 60
+    while True:
+        print(f"--- {datetime.now(KST):%m-%d %H:%M:%S}")
+        try:
+            state = check_once(state)
+        except Exception as e:  # 일시적 오류로 반복이 끊기지 않게
+            print(f"확인 중 오류: {e}")
+        sys.stdout.flush()
+        if time.monotonic() + INTERVAL_SEC > deadline:
+            break
+        time.sleep(INTERVAL_SEC)
+
+    if state != first:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(new_state, f, ensure_ascii=False, indent=1, sort_keys=True)
+            json.dump(state, f, ensure_ascii=False, indent=1, sort_keys=True)
 
 
 if __name__ == "__main__":
