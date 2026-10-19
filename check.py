@@ -208,6 +208,9 @@ def main():
         state = {}
     first = state
 
+    if os.environ.get("TEST_NOTIFY") == "true":
+        notify("🏕️ 테스트 알림", "GitHub에서 보낸 테스트예요. 빈자리가 생기면 이렇게 알려드려요.")
+
     deadline = time.monotonic() + LOOP_MINUTES * 60
     while True:
         print(f"--- {datetime.now(KST):%m-%d %H:%M:%S}")

@@ -6,6 +6,11 @@ on:
   schedule:
     - cron: "7 * * * *"
   workflow_dispatch:         # Actions 탭에서 수동 실행 버튼
+    inputs:
+      test:
+        description: "시작할 때 테스트 알림 보내기"
+        type: boolean
+        default: false
 
 permissions:
   contents: write            # state.json 저장용
@@ -29,6 +34,7 @@ jobs:
           KAKAO_REST_KEY: ${{ secrets.KAKAO_REST_KEY }}
           KAKAO_CLIENT_SECRET: ${{ secrets.KAKAO_CLIENT_SECRET }}
           KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
+          TEST_NOTIFY: ${{ inputs.test }}
           LOOP_MINUTES: "340"
           INTERVAL_SEC: "120"
         run: python -u check.py
