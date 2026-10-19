@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
@@ -83,17 +84,92 @@ def fetch_open_sites(ymd, kind):
         if s.get("sts") == "open" and str(s.get("fcltPosition", "")).startswith(kind + "_"))
 
 
-def notify(title, message):
+def send_ntfy(title, message):
     topic = os.environ.get("NTFY_TOPIC")
     if not topic:
-        print("[NTFY_TOPIC 없음 - 알림 생략]", title, message, sep="\n")
-        return
+        return False
     payload = {"topic": topic, "title": title, "message": message,
                "priority": 4, "tags": ["camping"], "click": BOOK_URL}
     req = urllib.request.Request(
         "https://ntfy.sh/", data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"})
     urllib.request.urlopen(req, timeout=20).read()
+    return True
+
+
+_kakao = {"token": None, "expires": 0, "warned": False}
+
+
+def _kakao_post(url, data, token=None):
+    headers = {"Content-Type": "application/x-www-form-urlencoded;charset=utf-8"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=urllib.parse.urlencode(data).encode(), headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        return {"error": e.code, "detail": e.read().decode(errors="replace")}
+
+
+def _kakao_warn(text):
+    """카톡 재연결이 필요할 때 실행당 한 번만 ntfy 로 알린다 (토큰 값은 출력하지 않음)."""
+    print(text)
+    if not _kakao["warned"]:
+        _kakao["warned"] = True
+        send_ntfy("⚠️ 카톡 알림 재연결 필요", text)
+
+
+def kakao_access_token():
+    rest = os.environ.get("KAKAO_REST_KEY")
+    refresh = os.environ.get("KAKAO_REFRESH_TOKEN")
+    if not rest or not refresh:
+        return None
+    if _kakao["token"] and time.time() < _kakao["expires"] - 300:
+        return _kakao["token"]
+    res = _kakao_post("https://kauth.kakao.com/oauth/token", {
+        "grant_type": "refresh_token", "client_id": rest, "refresh_token": refresh,
+        "client_secret": os.environ.get("KAKAO_CLIENT_SECRET", ""),
+    })
+    if "access_token" not in res:
+        _kakao_warn("카카오 연결이 만료돼 카톡 알림을 못 보내고 있어요. "
+                    "PC에서 kakao_setup.py 를 다시 실행해 주세요. (ntfy 알림은 계속 옵니다)")
+        return None
+    if "refresh_token" in res:  # 만료 한 달 이내라 새 토큰이 왔지만 여기선 저장할 수 없음
+        _kakao_warn("카톡 알림 연결이 한 달 안에 만료돼요. "
+                    "PC에서 kakao_setup.py 를 다시 실행해서 새 토큰으로 바꿔 주세요.")
+    _kakao["token"] = res["access_token"]
+    _kakao["expires"] = time.time() + int(res.get("expires_in", 0))
+    return _kakao["token"]
+
+
+def send_kakao(title, message):
+    token = kakao_access_token()
+    if not token:
+        return False
+    template = {"object_type": "text", "text": f"{title}\n{message}"[:200],
+                "link": {"web_url": BOOK_URL, "mobile_web_url": BOOK_URL},
+                "button_title": "예약 페이지"}
+    res = _kakao_post("https://kapi.kakao.com/v2/api/talk/memo/default/send",
+                      {"template_object": json.dumps(template, ensure_ascii=False)}, token)
+    if res.get("result_code") != 0:
+        print(f"카톡 발송 실패: {res.get('error')}")
+        return False
+    return True
+
+
+def notify(title, message):
+    sent = []
+    for name, fn in (("카톡", send_kakao), ("ntfy", send_ntfy)):
+        try:
+            if fn(title, message):
+                sent.append(name)
+        except Exception as e:  # 한쪽이 실패해도 다른 쪽은 보낸다
+            print(f"{name} 발송 오류: {e}")
+    if sent:
+        print("알림 발송:", ", ".join(sent))
+    else:
+        print("[알림 채널 없음 - 알림 생략]", title, message, sep="\n")
 
 
 def check_once(state):
@@ -120,7 +196,7 @@ def check_once(state):
             time.sleep(1)
 
     if alerts:
-        notify("🏕️ 시민의숲 야영장 빈자리!", "\n".join(alerts) + "\n\n눌러서 예약 페이지 열기")
+        notify("🏕️ 시민의숲 야영장 빈자리!", "\n".join(alerts))
     return new_state
 
 

@@ -26,6 +26,9 @@ jobs:
       - name: 빈자리 확인 (2분 간격 반복)
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          KAKAO_REST_KEY: ${{ secrets.KAKAO_REST_KEY }}
+          KAKAO_CLIENT_SECRET: ${{ secrets.KAKAO_CLIENT_SECRET }}
+          KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
           LOOP_MINUTES: "340"
           INTERVAL_SEC: "120"
         run: python -u check.py
