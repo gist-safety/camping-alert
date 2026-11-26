@@ -1,0 +1,50 @@
+name: 테니스장 빈자리 확인
+
+# GitHub 예약 실행은 몇 시간씩 밀리기도 해서, 한 번 시작하면 약 5시간 40분 동안
+# 2분마다 반복 확인한다. 매시간 다음 실행을 대기열에 넣어두면 끊김 없이 이어진다.
+on:
+  schedule:
+    - cron: "37 * * * *"
+  workflow_dispatch:         # Actions 탭에서 수동 실행 버튼
+    inputs:
+      test:
+        description: "시작할 때 테스트 알림 보내기"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write            # tennis_state.json 저장용
+
+concurrency:
+  group: tennis
+  cancel-in-progress: false  # 실행 중이면 다음 실행은 대기했다가 이어받음
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 빈자리 확인 (2분 간격 반복)
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          KAKAO_REST_KEY: ${{ secrets.KAKAO_REST_KEY }}
+          KAKAO_CLIENT_SECRET: ${{ secrets.KAKAO_CLIENT_SECRET }}
+          KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
+          TEST_NOTIFY: ${{ inputs.test }}
+          LOOP_MINUTES: "340"
+          INTERVAL_SEC: "120"
+        run: python -u tennis.py
+      - name: 상태 저장
+        if: always()
+        run: |
+          if [ -n "$(git status --porcelain tennis_state.json)" ]; then
+            git config user.name "github-actions"
+            git config user.email "github-actions@users.noreply.github.com"
+            git add tennis_state.json
+            git commit -m "테니스 상태 갱신"
+            git pull --rebase && git push
+          fi
