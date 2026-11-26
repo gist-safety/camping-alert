@@ -1,23 +1,29 @@
-"""광주 시민의숲 야영장 빈자리 감시 → ntfy 알림.
+"""광주 시민의숲 야영장 빈자리 감시 → 카톡 + ntfy 알림.
 
-dates.txt 에 적힌 날짜마다 일반(G)/자동차(C) 야영장의 예약가능 사이트를 조회하고,
-지난번보다 새로 열린 자리가 있으면 ntfy 로 휴대폰에 알림을 보낸다.
+dates.txt 에 적힌 날짜마다 일반(G)/자동차(C) 야영장의 예약가능 자리 수를 조회하고,
+지난번보다 자리 수가 늘었으면(=새로 열린 자리) 카톡과 ntfy 로 알림을 보낸다.
+
+2026-11 사이트 개편 이후 자리별 조회(getParkDetailData.do)는 로그인이 필요해져서,
+로그인 없이 보이는 월별 달력(getParkSchedule.do)의 "예약가능 n/전체" 숫자를 쓴다.
+달력 요청에는 페이지의 _csrf 값과 세션 쿠키가 함께 있어야 한다.
 
 GitHub 예약 실행(cron)은 몇 시간씩 밀리기 일쑤라, 한 번 실행되면
 LOOP_MINUTES 동안 INTERVAL_SEC 마다 반복 확인한다.
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from http.cookiejar import CookieJar
 from datetime import date, datetime, timedelta, timezone
 
 BASE = "https://www.gwangju.go.kr"
-DETAIL_URL = BASE + "/reserve/getParkDetailData.do"
+SCHEDULE_URL = BASE + "/reserve/getParkSchedule.do"
 BOOK_URL = BASE + "/reserve/parkBscList.do?pageId=reserve48"
 TYPES = {"G": "일반 야영장", "C": "자동차 야영장"}
 BSC_SN = {"G": "6", "C": "4"}  # 사이트 내부 시설번호
@@ -64,24 +70,69 @@ def read_dates():
     return targets
 
 
-def fetch_open_sites(ymd, kind):
-    """해당 날짜·야영장의 예약가능 사이트 번호 목록 (예: ['03', '15'])."""
+_session = {"opener": None, "csrf": None}
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/131.0 Safari/537.36")
+
+
+def _open_session():
+    """예약 페이지를 한 번 열어 세션 쿠키와 _csrf 값을 받아 둔다."""
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(CookieJar()))
+    req = urllib.request.Request(BOOK_URL, headers={"User-Agent": UA})
+    with opener.open(req, timeout=20) as r:
+        html = r.read().decode("utf-8", errors="replace")
+    m = (re.search(r'name="_csrf"[^>]*value="([^"]+)"', html)
+         or re.search(r'value="([^"]+)"[^>]*name="_csrf"', html)
+         or re.search(r'name="_csrf"\s+content="([^"]+)"', html))
+    if not m:
+        raise RuntimeError("예약 페이지에서 _csrf 값을 찾지 못했어요 (사이트 구조가 바뀌었을 수 있음)")
+    _session["opener"], _session["csrf"] = opener, m.group(1)
+
+
+def _post_schedule(kind, start, end):
     body = urllib.parse.urlencode({
-        "pageId": "reserve48", "ctgry": kind, "bscSn": BSC_SN[kind], "searchYmd": ymd,
+        "_csrf": _session["csrf"], "pageId": "reserve48", "ctgry": kind,
+        "bscSn": BSC_SN[kind], "startYmd": start, "endYmd": end,
+        "searchYmd": "", "fcltSn": "", "rsvDayCntVal": "",
     }).encode()
-    req = urllib.request.Request(DETAIL_URL, data=body, headers={
-        "User-Agent": "Mozilla/5.0",
+    req = urllib.request.Request(SCHEDULE_URL, data=body, headers={
+        "User-Agent": UA, "Referer": BASE + "/reserve/parkCalendar.do",
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         "X-Requested-With": "XMLHttpRequest",
     })
-    with urllib.request.urlopen(req, timeout=20) as r:
-        data = json.loads(r.read().decode("utf-8"))
+    with _session["opener"].open(req, timeout=20) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def fetch_month(kind, year, month):
+    """그 달의 날짜별 예약가능 자리 수 {'2026-12-01': 15, ...}.
+
+    화면의 '예약가능 n/전체' 와 같은 계산: n = useFcltCnt - useRsvtCnt02.
+    당일은 오후 6시까지만 예약할 수 있어서 6시 이후에는 0 으로 본다.
+    """
+    start = date(year, month, 1)
+    end = (start + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+    for attempt in (1, 2):  # 세션이 만료됐으면 한 번 새로 열고 다시 시도
+        try:
+            if not _session["opener"]:
+                _open_session()
+            data = _post_schedule(kind, start.isoformat(), end.isoformat())
+            break
+        except (urllib.error.HTTPError, json.JSONDecodeError):
+            _session["opener"] = None
+            if attempt == 2:
+                raise
     if data.get("error") != "N":
-        raise RuntimeError(f"{ymd} 조회 실패: {data}")
-    return sorted(
-        str(s["fcltPosition"]).rsplit("_", 1)[-1]
-        for s in data.get("useFcltList", [])
-        if s.get("sts") == "open" and str(s.get("fcltPosition", "")).startswith(kind + "_"))
+        raise RuntimeError(f"{year}-{month:02d} 달력 조회 실패: {data}")
+    now = datetime.now(KST)
+    result = {}
+    for s in data.get("scheduleList", []):
+        ymd = str(s.get("dday", "")).strip()
+        avail = int(s.get("useFcltCnt") or 0) - int(s.get("useRsvtCnt02") or 0)
+        if ymd == now.date().isoformat() and now.hour >= 18:
+            avail = 0
+        result[ymd] = max(avail, 0)
+    return result
 
 
 def send_ntfy(title, message):
@@ -173,31 +224,56 @@ def notify(title, message):
 
 
 def check_once(state):
-    """한 번 조회하고 알림을 보낸 뒤 새 상태를 돌려준다."""
+    """한 번 조회하고 알림을 보낸 뒤 새 상태를 돌려준다.
+
+    state 형식: {"2026-12-05": {"G": 3, "C": 0}, ...}  (예약가능 자리 수)
+    """
     targets = read_dates()
+    months = {}  # (kind, year, month) → {날짜: 자리 수}
     new_state = {}
     alerts = []
     for ymd, types in targets:
         prev = state.get(ymd, {})
         new_state[ymd] = {}
+        y, m = int(ymd[:4]), int(ymd[5:7])
         for t in types:
+            before = prev.get(t, 0)
+            if isinstance(before, list):  # 예전 형식(자리 번호 목록) 호환
+                before = len(before)
+            key = (t, y, m)
             try:
-                now_open = fetch_open_sites(ymd, t)
+                if key not in months:
+                    months[key] = fetch_month(t, y, m)
+                    time.sleep(1)
+                now_cnt = months[key].get(ymd, 0)
             except Exception as e:  # 하나 실패해도 나머지는 계속
                 print(f"{ymd} {TYPES[t]} 조회 실패: {e}")
-                new_state[ymd][t] = prev.get(t, [])
+                new_state[ymd][t] = before
                 continue
-            before = set(prev.get(t, []))
-            newly = [n for n in now_open if n not in before]
-            new_state[ymd][t] = now_open
-            print(f"{ymd} {TYPES[t]}: {len(now_open)}자리 예약가능")
-            if newly:
-                alerts.append(f"{ymd} {TYPES[t]}: {len(now_open)}자리 (새로 열림: {', '.join(newly)}번)")
-            time.sleep(1)
+            new_state[ymd][t] = now_cnt
+            print(f"{ymd} {TYPES[t]}: {now_cnt}자리 예약가능")
+            if now_cnt > before:
+                alerts.append(f"{ymd} {TYPES[t]}: {now_cnt}자리 예약가능 (전에는 {before}자리)")
 
     if alerts:
         notify("🏕️ 시민의숲 야영장 빈자리!", "\n".join(alerts))
     return new_state
+
+
+def site_check_summary():
+    """테스트 때 사이트 조회가 되는지 이번 달 달력을 한 번 읽어 본다."""
+    now = datetime.now(KST)
+    parts = []
+    for t in TYPES:
+        try:
+            days = fetch_month(t, now.year, now.month)
+            open_days = sum(1 for d, n in days.items() if n > 0 and d >= now.date().isoformat())
+            parts.append(f"{TYPES[t]} 이번 달 {open_days}일 예약가능")
+        except Exception as e:
+            parts.append(f"{TYPES[t]} 조회 실패: {e}")
+    text = "사이트 조회: " + ", ".join(parts)
+    print(text)
+    return text
 
 
 def main():
@@ -209,7 +285,8 @@ def main():
     first = state
 
     if os.environ.get("TEST_NOTIFY") == "true":
-        notify("🏕️ 테스트 알림", "GitHub에서 보낸 테스트예요. 빈자리가 생기면 이렇게 알려드려요.")
+        notify("🏕️ 테스트 알림", "GitHub에서 보낸 테스트예요. 빈자리가 생기면 이렇게 알려드려요.\n"
+               + site_check_summary())
 
     deadline = time.monotonic() + LOOP_MINUTES * 60
     while True:
